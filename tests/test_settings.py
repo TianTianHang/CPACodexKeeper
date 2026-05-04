@@ -27,6 +27,9 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.interval_seconds, 1800)
         self.assertEqual(settings.worker_threads, 8)
         self.assertTrue(settings.enable_refresh)
+        self.assertEqual(settings.web_host, "0.0.0.0")
+        self.assertEqual(settings.web_port, 8080)
+        self.assertEqual(settings.web_refresh_interval, 30)
 
     def test_load_settings_reads_from_project_env_file(self):
         env_file = self._make_env_file("CPA_ENDPOINT=https://env-file.example.com\nCPA_TOKEN=file-secret\nCPA_INTERVAL=120\nCPA_WORKER_THREADS=6\n")
@@ -66,5 +69,19 @@ class SettingsTests(unittest.TestCase):
     def test_load_settings_rejects_zero_worker_threads(self):
         env_file = Path("does-not-exist.env")
         with patch.dict(os.environ, {"CPA_ENDPOINT": "https://example.com", "CPA_TOKEN": "secret", "CPA_WORKER_THREADS": "0"}, clear=True):
+            with self.assertRaises(SettingsError):
+                load_settings(env_file=env_file)
+
+    def test_load_settings_reads_web_settings(self):
+        env_file = self._make_env_file("CPA_ENDPOINT=https://example.com\nCPA_TOKEN=secret\nCPA_WEB_HOST=127.0.0.1\nCPA_WEB_PORT=9090\nCPA_WEB_REFRESH_INTERVAL=5\n")
+        with patch.dict(os.environ, {}, clear=True):
+            settings = load_settings(env_file=env_file)
+        self.assertEqual(settings.web_host, "127.0.0.1")
+        self.assertEqual(settings.web_port, 9090)
+        self.assertEqual(settings.web_refresh_interval, 5)
+
+    def test_load_settings_rejects_invalid_web_port(self):
+        env_file = Path("does-not-exist.env")
+        with patch.dict(os.environ, {"CPA_ENDPOINT": "https://example.com", "CPA_TOKEN": "secret", "CPA_WEB_PORT": "70000"}, clear=True):
             with self.assertRaises(SettingsError):
                 load_settings(env_file=env_file)

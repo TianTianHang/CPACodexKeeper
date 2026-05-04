@@ -12,3 +12,6 @@ class DockerComposeTests(unittest.TestCase):
         self.assertIn("CPA_ENABLE_REFRESH:", compose_text)
         self.assertIn("CPA_ENABLE_REFRESH: ${CPA_ENABLE_REFRESH:-true}", compose_text)
         self.assertIn("CPA_WORKER_THREADS:", compose_text)
+        self.assertIn("command: [\"python\", \"main.py\", \"--web\"]", compose_text)
+        self.assertIn("${CPA_WEB_PORT:-8080}:${CPA_WEB_PORT:-8080}", compose_text)
+        self.assertIn("CPA_WEB_REFRESH_INTERVAL:", compose_text)

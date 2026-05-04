@@ -1,7 +1,9 @@
 import random
+import copy
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 
 from .cpa_client import CPAClient
 from .logging_utils import ConsoleLogger, TokenLogger
@@ -30,6 +32,161 @@ class CPACodexKeeper:
         )
         self.stats = MaintainerStats()
         self._stats_lock = threading.Lock()
+        self._monitor_lock = threading.Lock()
+        self.monitor_snapshot = self._new_monitor_snapshot()
+
+    def _now_iso(self):
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _new_monitor_snapshot(self):
+        now = self._now_iso()
+        return {
+            "state": "starting",
+            "round_no": 0,
+            "started_at": None,
+            "updated_at": now,
+            "finished_at": None,
+            "next_run_at": None,
+            "last_error": None,
+            "settings": {
+                "quota_threshold": self.settings.quota_threshold,
+                "expiry_threshold_days": self.settings.expiry_threshold_days,
+                "interval_seconds": self.settings.interval_seconds,
+                "refresh_enabled": self.settings.enable_refresh,
+            },
+            "total": 0,
+            "tokens": {},
+        }
+
+    def _build_monitor_summary(self, tokens, total):
+        return {
+            "total": total,
+            "processed": len(tokens),
+            "enabled": sum(1 for token in tokens if token.get("disabled") is False),
+            "disabled": sum(1 for token in tokens if token.get("disabled") is True),
+            "alive": sum(1 for token in tokens if token.get("health") == "alive"),
+            "invalid": sum(1 for token in tokens if token.get("health") == "invalid"),
+            "skipped": sum(1 for token in tokens if token.get("health") == "skipped"),
+            "network_error": sum(1 for token in tokens if token.get("health") == "network_error"),
+            "error": sum(1 for token in tokens if token.get("health") == "error"),
+            "quota_reached": sum(1 for token in tokens if token.get("quota_reached")),
+            "near_expiry": sum(1 for token in tokens if token.get("near_expiry")),
+            "expired": sum(1 for token in tokens if token.get("expired_status")),
+            "refreshed": sum(1 for token in tokens if token.get("action") == "refreshed"),
+            "disabled_action": sum(1 for token in tokens if token.get("action") == "disabled"),
+            "enabled_action": sum(1 for token in tokens if token.get("action") == "enabled"),
+            "deleted_action": sum(1 for token in tokens if token.get("action") == "deleted"),
+        }
+
+    def get_monitor_snapshot(self):
+        with self._monitor_lock:
+            snapshot = copy.deepcopy(self.monitor_snapshot)
+        tokens = sorted(snapshot.pop("tokens", {}).values(), key=lambda item: item.get("name", ""))
+        total = snapshot.pop("total", len(tokens))
+        snapshot["summary"] = self._build_monitor_summary(tokens, total)
+        snapshot["tokens"] = tokens
+        return snapshot
+
+    def begin_monitor_round(self, round_no=None):
+        now = self._now_iso()
+        with self._monitor_lock:
+            self.monitor_snapshot.update({
+                "state": "running",
+                "round_no": self.monitor_snapshot["round_no"] + 1 if round_no is None else round_no,
+                "started_at": now,
+                "updated_at": now,
+                "finished_at": None,
+                "next_run_at": None,
+                "last_error": None,
+                "settings": {
+                    "quota_threshold": self.settings.quota_threshold,
+                    "expiry_threshold_days": self.settings.expiry_threshold_days,
+                    "interval_seconds": self.settings.interval_seconds,
+                    "refresh_enabled": self.settings.enable_refresh,
+                },
+                "total": 0,
+                "tokens": {},
+            })
+
+    def update_monitor_total(self, total):
+        with self._monitor_lock:
+            self.monitor_snapshot["total"] = total
+            self.monitor_snapshot["updated_at"] = self._now_iso()
+
+    def finish_monitor_round(self, *, next_run_at=None):
+        now = self._now_iso()
+        with self._monitor_lock:
+            self.monitor_snapshot["state"] = "idle"
+            self.monitor_snapshot["finished_at"] = now
+            self.monitor_snapshot["updated_at"] = now
+            self.monitor_snapshot["next_run_at"] = next_run_at
+
+    def set_monitor_next_run(self, next_run_at):
+        with self._monitor_lock:
+            self.monitor_snapshot["next_run_at"] = next_run_at
+            self.monitor_snapshot["updated_at"] = self._now_iso()
+
+    def set_monitor_error(self, message):
+        with self._monitor_lock:
+            self.monitor_snapshot["state"] = "error"
+            self.monitor_snapshot["last_error"] = str(message)
+            self.monitor_snapshot["updated_at"] = self._now_iso()
+
+    def update_monitor_token(self, name, token_snapshot):
+        safe_snapshot = dict(token_snapshot)
+        safe_snapshot["name"] = name
+        safe_snapshot["checked_at"] = self._now_iso()
+        with self._monitor_lock:
+            self.monitor_snapshot["tokens"][name] = safe_snapshot
+            self.monitor_snapshot["updated_at"] = safe_snapshot["checked_at"]
+
+    def _base_token_snapshot(self, name, token_detail=None):
+        token_detail = token_detail or {}
+        disabled = bool(token_detail.get("disabled", False))
+        expired_str, remaining_seconds, expiry_known = get_expired_remaining_with_status(token_detail)
+        expiry_threshold_seconds = self.settings.expiry_threshold_days * 86400
+        return {
+            "name": name,
+            "email": token_detail.get("email", "unknown"),
+            "disabled": disabled,
+            "health": "checking",
+            "action": "none",
+            "status_code": None,
+            "plan_type": "unknown",
+            "expired": expired_str or "",
+            "remaining_seconds": remaining_seconds if expiry_known else None,
+            "remaining_label": format_seconds(remaining_seconds) if expiry_known else "未知",
+            "expiry_known": expiry_known,
+            "near_expiry": expiry_known and 0 < remaining_seconds < expiry_threshold_seconds,
+            "expired_status": expiry_known and remaining_seconds <= 0,
+            "has_refresh_token": self._has_refresh_token(token_detail),
+            "quota": {
+                "primary_label": None,
+                "primary_used_percent": None,
+                "primary_reset_at": None,
+                "secondary_label": None,
+                "secondary_used_percent": None,
+                "secondary_reset_at": None,
+            },
+            "has_credits": False,
+            "quota_reached": False,
+            "message": "",
+        }
+
+    def _quota_snapshot(self, body_info):
+        primary_label = format_window_label(body_info.get("primary_window_seconds"), "primary_window")
+        secondary_pct = body_info.get("secondary_used_percent")
+        secondary_label = None
+        if secondary_pct is not None:
+            secondary_label = format_window_label(body_info.get("secondary_window_seconds"), "secondary_window")
+        return {
+            "primary_label": primary_label,
+            "primary_used_percent": body_info.get("primary_used_percent", 0),
+            "primary_reset_at": body_info.get("primary_reset_at"),
+            "secondary_label": secondary_label,
+            "secondary_used_percent": secondary_pct,
+            "secondary_reset_at": body_info.get("secondary_reset_at"),
+        }
 
     def reset_stats(self):
         with self._stats_lock:
@@ -289,14 +446,14 @@ class CPACodexKeeper:
                     f"剩余 {remaining_str} < {self.settings.expiry_threshold_days} 天，但刷新功能已关闭",
                     indent=1,
                 )
-                return
+                return None
             if not disabled:
                 logger.log(
                     "INFO",
                     f"剩余 {remaining_str} < {self.settings.expiry_threshold_days} 天，但当前为启用状态，交给 CPA 自动刷新",
                     indent=1,
                 )
-                return
+                return None
             logger.log("WARN", f"剩余 {remaining_str} < {self.settings.expiry_threshold_days} 天，准备刷新", indent=1)
             success, new_data, msg = self.try_refresh(token_detail)
             if success:
@@ -309,46 +466,77 @@ class CPACodexKeeper:
                     _, new_remaining = get_expired_remaining(new_data)
                     logger.log("REFRESH", f"{msg}，新剩余: {format_seconds(new_remaining)}", indent=1)
                     self._inc_stat("refreshed")
+                    return "refreshed"
                 else:
                     logger.log("ERROR", "刷新成功但上传失败", indent=1)
             else:
                 logger.log("ERROR", f"刷新失败: {msg}", indent=1)
         elif remaining_seconds > 0:
             logger.log("INFO", f"过期时间充足 ({remaining_str})", indent=1)
+        return None
 
     def process_token(self, token_info, idx, total):
         name = token_info.get("name", "unknown")
         logger = TokenLogger(self.logger, idx, total, name)
+        token_snapshot = self._base_token_snapshot(name)
         try:
             logger.log("INFO", "获取详情...", indent=1)
             token_detail = self.get_token_detail(name)
             if not token_detail:
+                token_snapshot.update({"health": "skipped", "message": "获取详情失败"})
                 return self._skip_token("获取详情失败", logger)
+
+            token_snapshot = self._base_token_snapshot(name, token_detail)
 
             disabled, remaining_seconds, remaining_str, expiry_known = self._log_token_details(token_detail, logger)
             cleanup_result = self._apply_non_refreshable_expiry_policy(name, token_detail, remaining_seconds, expiry_known, logger)
             if cleanup_result:
+                token_snapshot.update({
+                    "health": "invalid",
+                    "action": "deleted",
+                    "disabled": disabled,
+                    "message": "Token 已过期且无 Refresh Token，已删除",
+                })
                 return cleanup_result
             access_token = token_detail.get("access_token")
             account_id = token_detail.get("account_id")
             if not access_token:
+                token_snapshot.update({"health": "skipped", "message": "缺少 access_token"})
                 return self._skip_token("缺少 access_token", logger)
 
             logger.log("INFO", "检测在线状态...", indent=1)
             status, resp_data = self.check_token_live(access_token, account_id)
+            token_snapshot["status_code"] = status
             if status in (401, 402):
+                token_snapshot.update({"health": "invalid", "action": "deleted", "message": "Token 无效或 workspace 已停用，已删除"})
                 return self._handle_invalid_token(name, logger)
             if status is None:
                 detail = resp_data.get("brief", "") if isinstance(resp_data, dict) else str(resp_data)
                 msg = "网络检测失败"
                 if detail:
                     msg += f" | {detail}"
+                token_snapshot.update({"health": "network_error", "message": msg})
                 return self._skip_token(msg, logger, network_error=True)
             if status != 200:
+                detail = resp_data.get("brief", "") if isinstance(resp_data, dict) else str(resp_data)
+                msg = f"状态异常 ({status})"
+                if detail:
+                    msg += f" | {detail}"
+                token_snapshot.update({"health": "skipped", "message": msg})
                 return self._handle_non_200_status(status, resp_data, logger)
 
             body_info = self.parse_usage_info(resp_data)
+            token_snapshot.update({
+                "health": "alive",
+                "plan_type": body_info.get("plan_type", "unknown"),
+                "quota": self._quota_snapshot(body_info),
+                "has_credits": body_info.get("has_credits", False),
+            })
             primary_pct, secondary_pct, primary_label, secondary_label = self._log_usage_summary(body_info, logger)
+            quota_reached = primary_pct >= self.settings.quota_threshold or (
+                secondary_pct is not None and secondary_pct >= self.settings.quota_threshold
+            )
+            token_snapshot["quota_reached"] = quota_reached
             quota_result, refresh_disabled = self._apply_quota_policy(
                 name,
                 disabled,
@@ -360,8 +548,12 @@ class CPACodexKeeper:
                 secondary_label=secondary_label,
             )
             if quota_result:
+                token_snapshot.update({"action": "deleted", "message": "无 Refresh Token 且额度达到阈值，已删除"})
                 return quota_result
-            self._apply_refresh_policy(
+            if refresh_disabled != disabled:
+                token_snapshot["disabled"] = refresh_disabled
+                token_snapshot["action"] = "enabled" if not refresh_disabled else "disabled"
+            refresh_action = self._apply_refresh_policy(
                 name,
                 token_detail,
                 remaining_seconds,
@@ -369,11 +561,17 @@ class CPACodexKeeper:
                 logger,
                 disabled=refresh_disabled,
             )
+            if refresh_action:
+                token_snapshot["action"] = refresh_action
 
             self._inc_stat("alive")
             logger.blank_line()
             return "alive"
+        except Exception as exc:
+            token_snapshot.update({"health": "error", "message": str(exc)})
+            raise
         finally:
+            self.update_monitor_token(name, token_snapshot)
             logger.flush()
 
     def log_startup(self):
@@ -388,14 +586,17 @@ class CPACodexKeeper:
         self.logger.divider()
 
     def run(self):
+        self.begin_monitor_round()
         self.reset_stats()
         self.log_startup()
         tokens = self.get_token_list()
         if not tokens:
             self.log("WARN", "未获取到任何 codex Token")
+            self.finish_monitor_round()
             return
 
         self._set_total(len(tokens))
+        self.update_monitor_total(len(tokens))
         random.shuffle(tokens)
         start_time = time.time()
         total = len(tokens)
@@ -414,6 +615,33 @@ class CPACodexKeeper:
                     future.result()
                 except Exception as exc:
                     token_name = future_map[future].get("name", "unknown")
+                    self.update_monitor_token(token_name, {
+                        "name": token_name,
+                        "email": "unknown",
+                        "disabled": None,
+                        "health": "error",
+                        "action": "none",
+                        "status_code": None,
+                        "plan_type": "unknown",
+                        "expired": "",
+                        "remaining_seconds": None,
+                        "remaining_label": "未知",
+                        "expiry_known": False,
+                        "near_expiry": False,
+                        "expired_status": False,
+                        "has_refresh_token": False,
+                        "quota": {
+                            "primary_label": None,
+                            "primary_used_percent": None,
+                            "primary_reset_at": None,
+                            "secondary_label": None,
+                            "secondary_used_percent": None,
+                            "secondary_reset_at": None,
+                        },
+                        "has_credits": False,
+                        "quota_reached": False,
+                        "message": str(exc),
+                    })
                     self.log("ERROR", f"Token 任务异常 ({token_name}): {exc}", indent=1)
                     self.blank_line()
 
@@ -432,6 +660,7 @@ class CPACodexKeeper:
         self.log("INFO", f"- 跳过: {stats['skipped']}", indent=1)
         self.log("INFO", f"- 网络失败: {stats['network_error']}", indent=1)
         self.logger.divider()
+        self.finish_monitor_round()
 
     def run_forever(self, interval_seconds=1800):
         round_no = 0
@@ -445,6 +674,8 @@ class CPACodexKeeper:
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
+                self.set_monitor_error(exc)
                 self.log("ERROR", f"第 {round_no} 轮巡检异常: {exc}")
             self.log("INFO", f"等待 {interval_seconds} 秒后开始下一轮")
+            self.set_monitor_next_run(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + interval_seconds)))
             time.sleep(interval_seconds)

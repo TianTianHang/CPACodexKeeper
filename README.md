@@ -142,6 +142,9 @@ cp .env.example .env
 - `CPA_USAGE_TIMEOUT`：OpenAI usage 请求超时秒数，默认 `15`
 - `CPA_MAX_RETRIES`：临时网络 / 5xx 错误重试次数，默认 `2`
 - `CPA_WORKER_THREADS`：单轮巡检的并发线程数，默认 `8`
+- `CPA_WEB_HOST`：只读 Web 面板监听地址，默认 `0.0.0.0`
+- `CPA_WEB_PORT`：只读 Web 面板端口，默认 `8080`
+- `CPA_WEB_REFRESH_INTERVAL`：浏览器自动刷新间隔秒数，默认 `30`
 
 推荐直接参考 `.env.example` 中的中英双语注释填写。
 
@@ -178,6 +181,35 @@ python main.py --once
 ```bash
 python main.py
 ```
+
+### 只读 Web 面板
+
+Web 面板用于查看最近一轮或当前轮的号池维护数据。面板只读取内存快照，不触发 CPA 删除、禁用、启用、上传，也不触发 OpenAI usage 检测或 refresh。
+
+启动方式：
+
+```bash
+python main.py --web
+```
+
+访问：
+
+```text
+http://localhost:8080
+```
+
+`--web` 会并行运行两部分：
+
+- 原有自动维护线程继续按 `CPA_INTERVAL` 巡检和维护号池
+- Web 服务通过 `/api/status` 读取维护线程写入的内存快照
+
+接口：
+
+- `GET /`：只读监控页面
+- `GET /api/status`：返回 JSON 快照
+- `GET /healthz`：健康检查
+
+快照不会包含 `access_token`、`refresh_token`、`id_token`、`CPA_TOKEN` 等敏感字段。
 
 ### 演练模式
 

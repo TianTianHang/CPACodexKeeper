@@ -11,6 +11,9 @@ DEFAULT_CPA_TIMEOUT_SECONDS = 30
 DEFAULT_MAX_RETRIES = 2
 DEFAULT_WORKER_THREADS = 8
 DEFAULT_ENABLE_REFRESH = True
+DEFAULT_WEB_HOST = "0.0.0.0"
+DEFAULT_WEB_PORT = 8080
+DEFAULT_WEB_REFRESH_INTERVAL = 30
 PROJECT_ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 
 
@@ -31,6 +34,9 @@ class Settings:
     max_retries: int = DEFAULT_MAX_RETRIES
     worker_threads: int = DEFAULT_WORKER_THREADS
     enable_refresh: bool = DEFAULT_ENABLE_REFRESH
+    web_host: str = DEFAULT_WEB_HOST
+    web_port: int = DEFAULT_WEB_PORT
+    web_refresh_interval: int = DEFAULT_WEB_REFRESH_INTERVAL
 
 
 def _read_project_env_file(env_file: Path | None = None) -> dict[str, str]:
@@ -93,6 +99,7 @@ def load_settings(env_file: Path | None = None) -> Settings:
     endpoint = (_get_config_value("CPA_ENDPOINT", env_values) or "").strip().rstrip("/")
     token = (_get_config_value("CPA_TOKEN", env_values) or "").strip()
     proxy = (_get_config_value("CPA_PROXY", env_values) or "").strip() or None
+    web_host = (_get_config_value("CPA_WEB_HOST", env_values) or DEFAULT_WEB_HOST).strip() or DEFAULT_WEB_HOST
 
     if not endpoint:
         raise SettingsError("CPA_ENDPOINT is required")
@@ -113,4 +120,7 @@ def load_settings(env_file: Path | None = None) -> Settings:
         max_retries=_read_int("CPA_MAX_RETRIES", DEFAULT_MAX_RETRIES, env_values, minimum=0, maximum=5),
         worker_threads=_read_int("CPA_WORKER_THREADS", DEFAULT_WORKER_THREADS, env_values, minimum=1),
         enable_refresh=_read_bool("CPA_ENABLE_REFRESH", DEFAULT_ENABLE_REFRESH, env_values),
+        web_host=web_host,
+        web_port=_read_int("CPA_WEB_PORT", DEFAULT_WEB_PORT, env_values, minimum=1, maximum=65535),
+        web_refresh_interval=_read_int("CPA_WEB_REFRESH_INTERVAL", DEFAULT_WEB_REFRESH_INTERVAL, env_values, minimum=1),
     )

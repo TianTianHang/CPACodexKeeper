@@ -83,6 +83,9 @@ class MaintainerTests(unittest.TestCase):
         result = self.maintainer.process_token({"name": "t1"}, 1, 1)
         self.assertEqual(result, "dead")
         self.assertEqual(self.maintainer.stats.dead, 1)
+        snapshot = self.maintainer.get_monitor_snapshot()
+        self.assertEqual(snapshot["tokens"][0]["health"], "invalid")
+        self.assertEqual(snapshot["tokens"][0]["action"], "deleted")
 
     def test_process_token_deletes_invalid_token_on_402(self):
         self.maintainer.get_token_detail = Mock(return_value={
@@ -468,6 +471,58 @@ class MaintainerTests(unittest.TestCase):
         args, kwargs = self.maintainer.delete_token.call_args
         self.assertEqual(args, ("t-no-rt",))
         self.assertIn("logger", kwargs)
+
+    def test_monitor_snapshot_redacts_token_material(self):
+        self.maintainer.get_token_detail = Mock(return_value={
+            "email": "a@example.com",
+            "disabled": False,
+            "access_token": "secret-access",
+            "refresh_token": "secret-refresh",
+            "id_token": "secret-id",
+            "account_id": "acc",
+            "expired": "2099-01-01T00:00:00Z",
+        })
+        self.maintainer.check_token_live = Mock(return_value=(200, {
+            "body": "raw-body",
+            "json": {
+                "plan_type": "team",
+                "rate_limit": {
+                    "primary_window": {"used_percent": 10, "limit_window_seconds": 18000, "reset_at": 1},
+                    "secondary_window": {"used_percent": 20, "limit_window_seconds": 604800, "reset_at": 2},
+                },
+                "credits": {"has_credits": True},
+            }
+        }))
+
+        self.maintainer.process_token({"name": "safe-token"}, 1, 1)
+
+        snapshot_text = str(self.maintainer.get_monitor_snapshot())
+        self.assertNotIn("secret-access", snapshot_text)
+        self.assertNotIn("secret-refresh", snapshot_text)
+        self.assertNotIn("secret-id", snapshot_text)
+        self.assertNotIn("raw-body", snapshot_text)
+        snapshot = self.maintainer.get_monitor_snapshot()
+        token = snapshot["tokens"][0]
+        self.assertEqual(token["email"], "a@example.com")
+        self.assertEqual(token["quota"]["primary_label"], "5h")
+        self.assertEqual(token["quota"]["secondary_label"], "Week")
+        self.assertTrue(token["has_refresh_token"])
+
+    def test_monitor_summary_is_derived_from_tokens(self):
+        self.maintainer.update_monitor_total(3)
+        self.maintainer.update_monitor_token("a", {"disabled": False, "health": "alive", "action": "none", "quota_reached": False, "near_expiry": False, "expired_status": False})
+        self.maintainer.update_monitor_token("b", {"disabled": True, "health": "network_error", "action": "none", "quota_reached": True, "near_expiry": True, "expired_status": False})
+
+        summary = self.maintainer.get_monitor_snapshot()["summary"]
+
+        self.assertEqual(summary["total"], 3)
+        self.assertEqual(summary["processed"], 2)
+        self.assertEqual(summary["enabled"], 1)
+        self.assertEqual(summary["disabled"], 1)
+        self.assertEqual(summary["alive"], 1)
+        self.assertEqual(summary["network_error"], 1)
+        self.assertEqual(summary["quota_reached"], 1)
+        self.assertEqual(summary["near_expiry"], 1)
 
     def test_process_token_keeps_non_refreshable_token_when_expiry_is_unknown(self):
         self.maintainer.get_token_detail = Mock(return_value={
